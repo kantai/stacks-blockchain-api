@@ -14,13 +14,12 @@ import {
   formatMapToObject,
   getSendManyContract,
   has0xPrefix,
-  InvalidRequestError,
-  InvalidRequestErrorType,
   isProdEnv,
   isValidC32Address,
   isValidPrincipal,
   logger,
 } from '../../helpers';
+import { InvalidRequestError, InvalidRequestErrorType } from '../../errors';
 import { getTxFromDataStore, parseDbEvent, parseDbMempoolTx } from '../controllers/db-controller';
 import {
   TransactionResults,
