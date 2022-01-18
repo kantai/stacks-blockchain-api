@@ -10,6 +10,7 @@ import * as winston from 'winston';
 
 import { hexToBuffer, logError, logger, digestSha512_256, I32_MAX, LogLevel } from '../helpers';
 import {
+  CoreNodeMinedBlock,
   CoreNodeBlockMessage,
   CoreNodeEventType,
   CoreNodeBurnBlockMessage,
@@ -62,35 +63,21 @@ import {
   StringAsciiCV,
   TupleCV,
 } from '@stacks/transactions';
-import {
-  getFunctionName,
-  getNewOwner,
-  parseNameRawValue,
-  parseNamespaceRawValue,
-  parseResolver,
-  parseZoneFileTxt,
-} from '../bns-helpers';
 
-import {
-  printTopic,
-  namespaceReadyFunction,
-  nameFunctions,
-  BnsContractIdentifier,
-} from '../bns-constants';
+import { SqliteDataStore } from './event-store';
 
 import * as zoneFileParser from 'zone-file';
 
 async function handleRawEventRequest(
   eventPath: string,
   payload: string,
-  db: DataStore
+  db: DataStore | null
 ): Promise<void> {
-  await db.storeRawEventRequest(eventPath, payload);
 }
 
 async function handleBurnBlockMessage(
   burnBlockMsg: CoreNodeBurnBlockMessage,
-  db: DataStore
+  db: DataStore | null
 ): Promise<void> {
   logger.verbose(
     `Received burn block message hash ${burnBlockMsg.burn_block_hash}, height: ${burnBlockMsg.burn_block_height}, reward recipients: ${burnBlockMsg.reward_recipients.length}`
@@ -117,19 +104,9 @@ async function handleBurnBlockMessage(
     };
     return slotHolder;
   });
-  await db.updateBurnchainRewards({
-    burnchainBlockHash: burnBlockMsg.burn_block_hash,
-    burnchainBlockHeight: burnBlockMsg.burn_block_height,
-    rewards: rewards,
-  });
-  await db.updateBurnchainRewardSlotHolders({
-    burnchainBlockHash: burnBlockMsg.burn_block_hash,
-    burnchainBlockHeight: burnBlockMsg.burn_block_height,
-    slotHolders: slotHolders,
-  });
 }
 
-async function handleMempoolTxsMessage(rawTxs: string[], db: DataStore): Promise<void> {
+async function handleMempoolTxsMessage(rawTxs: string[], db: DataStore | null): Promise<void> {
   logger.verbose(`Received ${rawTxs.length} mempool transactions`);
   // TODO: mempool-tx receipt date should be sent from the core-node
   const receiptDate = Math.round(Date.now() / 1000);
@@ -160,22 +137,20 @@ async function handleMempoolTxsMessage(rawTxs: string[], db: DataStore): Promise
     });
     return dbMempoolTx;
   });
-  await db.updateMempoolTxs({ mempoolTxs: dbMempoolTxs });
 }
 
 async function handleDroppedMempoolTxsMessage(
   msg: CoreNodeDropMempoolTxMessage,
-  db: DataStore
+  db: DataStore | null
 ): Promise<void> {
   logger.verbose(`Received ${msg.dropped_txids.length} dropped mempool txs`);
   const dbTxStatus = getTxDbStatus(msg.reason);
-  await db.dropMempoolTxs({ status: dbTxStatus, txIds: msg.dropped_txids });
 }
 
 async function handleMicroblockMessage(
   chainId: ChainID,
   msg: CoreNodeMicroblockMessage,
-  db: DataStore
+  db: DataStore | null
 ): Promise<void> {
   logger.verbose(`Received microblock with ${msg.transactions.length} txs`);
   const dbMicroblocks = parseMicroblocksFromTxs({
@@ -214,20 +189,12 @@ async function handleMicroblockMessage(
   parsedTxs.forEach(tx => {
     logger.verbose(`Received microblock mined tx: ${tx.core_tx.txid}`);
   });
-  const updateData: DataStoreMicroblockUpdateData = {
-    microblocks: dbMicroblocks,
-    txs: parseDataStoreTxEventData(parsedTxs, msg.events, {
-      block_height: -1, // TODO: fill during initial db insert
-      index_block_hash: '',
-    }),
-  };
-  await db.updateMicroblocks(updateData);
 }
 
 async function handleBlockMessage(
   chainId: ChainID,
   msg: CoreNodeBlockMessage,
-  db: DataStore
+  db: DataStore | null
 ): Promise<void> {
   const parsedTxs: CoreNodeParsedTxMessage[] = [];
   const blockData: CoreNodeMsgBlockData = {
@@ -262,47 +229,6 @@ async function handleBlockMessage(
 
   logger.verbose(`Received block ${msg.block_hash} (${msg.block_height}) from node`, dbBlock);
 
-  const dbMinerRewards: DbMinerReward[] = [];
-  for (const minerReward of msg.matured_miner_rewards) {
-    const dbMinerReward: DbMinerReward = {
-      canonical: true,
-      block_hash: minerReward.from_stacks_block_hash,
-      index_block_hash: msg.index_block_hash,
-      from_index_block_hash: minerReward.from_index_consensus_hash,
-      mature_block_height: msg.block_height,
-      recipient: minerReward.recipient,
-      coinbase_amount: BigInt(minerReward.coinbase_amount),
-      tx_fees_anchored: BigInt(minerReward.tx_fees_anchored),
-      tx_fees_streamed_confirmed: BigInt(minerReward.tx_fees_streamed_confirmed),
-      tx_fees_streamed_produced: BigInt(minerReward.tx_fees_streamed_produced),
-    };
-    dbMinerRewards.push(dbMinerReward);
-  }
-
-  logger.verbose(`Received ${dbMinerRewards.length} matured miner rewards`);
-
-  const dbMicroblocks = parseMicroblocksFromTxs({
-    parentIndexBlockHash: msg.parent_index_block_hash,
-    txs: msg.transactions,
-    parentBurnBlock: {
-      height: msg.parent_burn_block_height,
-      hash: msg.parent_burn_block_hash,
-      time: msg.parent_burn_block_timestamp,
-    },
-  }).map(mb => {
-    const microblock: DbMicroblock = {
-      ...mb,
-      canonical: true,
-      microblock_canonical: true,
-      block_height: msg.block_height,
-      parent_block_height: msg.block_height - 1,
-      parent_block_hash: msg.parent_block_hash,
-      index_block_hash: msg.index_block_hash,
-      block_hash: msg.block_hash,
-    };
-    return microblock;
-  });
-
   parsedTxs.forEach(tx => {
     logger.verbose(`Received anchor block mined tx: ${tx.core_tx.txid}`);
     logger.info('Transaction confirmed', {
@@ -311,15 +237,6 @@ async function handleBlockMessage(
       stacks_height: dbBlock.block_height,
     });
   });
-
-  const dbData: DataStoreBlockUpdateData = {
-    block: dbBlock,
-    microblocks: dbMicroblocks,
-    minerRewards: dbMinerRewards,
-    txs: parseDataStoreTxEventData(parsedTxs, msg.events, msg),
-  };
-
-  await db.update(dbData);
 }
 
 function parseDataStoreTxEventData(
@@ -374,187 +291,6 @@ function parseDataStoreTxEventData(
       canonical: true,
     };
 
-    switch (event.type) {
-      case CoreNodeEventType.ContractEvent: {
-        const entry: DbSmartContractEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.SmartContractLog,
-          contract_identifier: event.contract_event.contract_identifier,
-          topic: event.contract_event.topic,
-          value: hexToBuffer(event.contract_event.raw_value),
-        };
-        dbTx.contractLogEvents.push(entry);
-        if (
-          event.contract_event.topic === printTopic &&
-          (event.contract_event.contract_identifier === BnsContractIdentifier.mainnet ||
-            event.contract_event.contract_identifier === BnsContractIdentifier.testnet)
-        ) {
-          const functionName = getFunctionName(event.txid, parsedTxs);
-          if (nameFunctions.includes(functionName)) {
-            const attachment = parseNameRawValue(event.contract_event.raw_value);
-            let name_address = addressToString(attachment.attachment.metadata.tx_sender);
-            if (functionName === 'name-transfer') {
-              const new_owner = getNewOwner(event.txid, parsedTxs);
-              if (new_owner) {
-                name_address = addressToString(new_owner);
-              }
-            }
-            const name: DbBnsName = {
-              name: attachment.attachment.metadata.name.concat(
-                '.',
-                attachment.attachment.metadata.namespace
-              ),
-              namespace_id: attachment.attachment.metadata.namespace,
-              address: name_address,
-              expire_block: 0,
-              registered_at: blockData.block_height,
-              zonefile_hash: attachment.attachment.hash,
-              zonefile: '', // zone file will be updated in  /attachments/new
-              tx_id: event.txid,
-              tx_index: entry.tx_index,
-              status: attachment.attachment.metadata.op,
-              canonical: true,
-            };
-            dbTx.names.push(name);
-          }
-          if (functionName === namespaceReadyFunction) {
-            // event received for namespaces
-            const namespace: DbBnsNamespace | undefined = parseNamespaceRawValue(
-              event.contract_event.raw_value,
-              blockData.block_height,
-              event.txid,
-              entry.tx_index
-            );
-            if (namespace != undefined) {
-              dbTx.namespaces.push(namespace);
-            }
-          }
-        }
-        break;
-      }
-      case CoreNodeEventType.StxLockEvent: {
-        const entry: DbStxLockEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.StxLock,
-          locked_amount: BigInt(event.stx_lock_event.locked_amount),
-          unlock_height: Number(event.stx_lock_event.unlock_height),
-          locked_address: event.stx_lock_event.locked_address,
-        };
-        dbTx.stxLockEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.StxTransferEvent: {
-        const entry: DbStxEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.StxAsset,
-          asset_event_type_id: DbAssetEventTypeId.Transfer,
-          sender: event.stx_transfer_event.sender,
-          recipient: event.stx_transfer_event.recipient,
-          amount: BigInt(event.stx_transfer_event.amount),
-        };
-        dbTx.stxEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.StxMintEvent: {
-        const entry: DbStxEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.StxAsset,
-          asset_event_type_id: DbAssetEventTypeId.Mint,
-          recipient: event.stx_mint_event.recipient,
-          amount: BigInt(event.stx_mint_event.amount),
-        };
-        dbTx.stxEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.StxBurnEvent: {
-        const entry: DbStxEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.StxAsset,
-          asset_event_type_id: DbAssetEventTypeId.Burn,
-          sender: event.stx_burn_event.sender,
-          amount: BigInt(event.stx_burn_event.amount),
-        };
-        dbTx.stxEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.FtTransferEvent: {
-        const entry: DbFtEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.FungibleTokenAsset,
-          asset_event_type_id: DbAssetEventTypeId.Transfer,
-          sender: event.ft_transfer_event.sender,
-          recipient: event.ft_transfer_event.recipient,
-          asset_identifier: event.ft_transfer_event.asset_identifier,
-          amount: BigInt(event.ft_transfer_event.amount),
-        };
-        dbTx.ftEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.FtMintEvent: {
-        const entry: DbFtEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.FungibleTokenAsset,
-          asset_event_type_id: DbAssetEventTypeId.Mint,
-          recipient: event.ft_mint_event.recipient,
-          asset_identifier: event.ft_mint_event.asset_identifier,
-          amount: BigInt(event.ft_mint_event.amount),
-        };
-        dbTx.ftEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.FtBurnEvent: {
-        const entry: DbFtEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.FungibleTokenAsset,
-          asset_event_type_id: DbAssetEventTypeId.Burn,
-          sender: event.ft_burn_event.sender,
-          asset_identifier: event.ft_burn_event.asset_identifier,
-          amount: BigInt(event.ft_burn_event.amount),
-        };
-        dbTx.ftEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.NftTransferEvent: {
-        const entry: DbNftEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.NonFungibleTokenAsset,
-          asset_event_type_id: DbAssetEventTypeId.Transfer,
-          recipient: event.nft_transfer_event.recipient,
-          sender: event.nft_transfer_event.sender,
-          asset_identifier: event.nft_transfer_event.asset_identifier,
-          value: hexToBuffer(event.nft_transfer_event.raw_value),
-        };
-        dbTx.nftEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.NftMintEvent: {
-        const entry: DbNftEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.NonFungibleTokenAsset,
-          asset_event_type_id: DbAssetEventTypeId.Mint,
-          recipient: event.nft_mint_event.recipient,
-          asset_identifier: event.nft_mint_event.asset_identifier,
-          value: hexToBuffer(event.nft_mint_event.raw_value),
-        };
-        dbTx.nftEvents.push(entry);
-        break;
-      }
-      case CoreNodeEventType.NftBurnEvent: {
-        const entry: DbNftEvent = {
-          ...dbEvent,
-          event_type: DbEventTypeId.NonFungibleTokenAsset,
-          asset_event_type_id: DbAssetEventTypeId.Burn,
-          sender: event.nft_burn_event.sender,
-          asset_identifier: event.nft_burn_event.asset_identifier,
-          value: hexToBuffer(event.nft_burn_event.raw_value),
-        };
-        dbTx.nftEvents.push(entry);
-        break;
-      }
-      default: {
-        throw new Error(`Unexpected CoreNodeEventType: ${inspect(event)}`);
-      }
-    }
   }
 
   // Normalize event indexes from per-block to per-transaction contiguous series.
@@ -577,104 +313,32 @@ function parseDataStoreTxEventData(
   return dbData;
 }
 
-async function handleNewAttachmentMessage(msg: CoreNodeAttachmentMessage[], db: DataStore) {
-  for (const attachment of msg) {
-    if (
-      attachment.contract_id === BnsContractIdentifier.mainnet ||
-      attachment.contract_id === BnsContractIdentifier.testnet
-    ) {
-      const metadataCV: TupleCV = deserializeCV(hexToBuffer(attachment.metadata));
-      const opCV: StringAsciiCV = metadataCV.data['op'] as StringAsciiCV;
-      const op = opCV.data;
-      const zonefile = Buffer.from(attachment.content.slice(2), 'hex').toString();
-      const zoneFileHash = attachment.content_hash;
-      if (op === 'name-update') {
-        const name = (metadataCV.data['name'] as BufferCV).buffer.toString('utf8');
-        const namespace = (metadataCV.data['namespace'] as BufferCV).buffer.toString('utf8');
-        const zoneFileContents = zoneFileParser.parseZoneFile(zonefile);
-        const zoneFileTxt = zoneFileContents.txt;
-        const blockData = {
-          index_block_hash: '',
-          parent_index_block_hash: '',
-          microblock_hash: '',
-          microblock_sequence: I32_MAX,
-          microblock_canonical: true,
-        };
-        // Case for subdomain
-        if (zoneFileTxt) {
-          // get unresolved subdomain
-          let isCanonical = true;
-          const dbTx = await db.getTxStrict({
-            txId: attachment.tx_id,
-            indexBlockHash: attachment.index_block_hash,
-          });
-          if (dbTx.found) {
-            isCanonical = dbTx.result.canonical;
-            blockData.index_block_hash = dbTx.result.index_block_hash;
-            blockData.parent_index_block_hash = dbTx.result.parent_index_block_hash;
-            blockData.microblock_hash = dbTx.result.microblock_hash;
-            blockData.microblock_sequence = dbTx.result.microblock_sequence;
-            blockData.microblock_canonical = dbTx.result.microblock_canonical;
-          } else {
-            logger.warn(
-              `Could not find transaction ${attachment.tx_id} associated with attachment`
-            );
-          }
-          // case for subdomain
-          const subdomains: DbBnsSubdomain[] = [];
-          for (let i = 0; i < zoneFileTxt.length; i++) {
-            const zoneFile = zoneFileTxt[i];
-            const parsedTxt = parseZoneFileTxt(zoneFile.txt);
-            if (parsedTxt.owner === '') continue; //if txt has no owner , skip it
-            const subdomain: DbBnsSubdomain = {
-              name: name.concat('.', namespace),
-              namespace_id: namespace,
-              fully_qualified_subdomain: zoneFile.name.concat('.', name, '.', namespace),
-              owner: parsedTxt.owner,
-              zonefile_hash: parsedTxt.zoneFileHash,
-              zonefile: parsedTxt.zoneFile,
-              tx_id: attachment.tx_id,
-              tx_index: -1,
-              canonical: isCanonical,
-              parent_zonefile_hash: attachment.content_hash.slice(2),
-              parent_zonefile_index: 0, //TODO need to figure out this field
-              block_height: Number.parseInt(attachment.block_height, 10),
-              zonefile_offset: 1,
-              resolver: zoneFileContents.uri ? parseResolver(zoneFileContents.uri) : '',
-            };
-            subdomains.push(subdomain);
-          }
-          await db.resolveBnsSubdomains(blockData, subdomains);
-        }
-      }
-      await db.updateZoneContent(zonefile, zoneFileHash, attachment.tx_id);
-    }
-  }
+async function handleNewAttachmentMessage(msg: CoreNodeAttachmentMessage[], db: DataStore | null) {
 }
 
 interface EventMessageHandler {
-  handleRawEventRequest(eventPath: string, payload: string, db: DataStore): Promise<void> | void;
+  handleRawEventRequest(eventPath: string, payload: string, db: DataStore | null): Promise<void> | void;
   handleBlockMessage(
     chainId: ChainID,
     msg: CoreNodeBlockMessage,
-    db: DataStore
+    db: DataStore | null
   ): Promise<void> | void;
   handleMicroblockMessage(
     chainId: ChainID,
     msg: CoreNodeMicroblockMessage,
-    db: DataStore
+    db: DataStore | null
   ): Promise<void> | void;
-  handleMempoolTxs(rawTxs: string[], db: DataStore): Promise<void> | void;
-  handleBurnBlock(msg: CoreNodeBurnBlockMessage, db: DataStore): Promise<void> | void;
-  handleDroppedMempoolTxs(msg: CoreNodeDropMempoolTxMessage, db: DataStore): Promise<void> | void;
-  handleNewAttachment(msg: CoreNodeAttachmentMessage[], db: DataStore): Promise<void> | void;
+  handleMempoolTxs(rawTxs: string[], db: DataStore | null): Promise<void> | void;
+  handleBurnBlock(msg: CoreNodeBurnBlockMessage, db: DataStore | null): Promise<void> | void;
+  handleDroppedMempoolTxs(msg: CoreNodeDropMempoolTxMessage, db: DataStore | null): Promise<void> | void;
+  handleNewAttachment(msg: CoreNodeAttachmentMessage[], db: DataStore | null): Promise<void> | void;
 }
 
 function createMessageProcessorQueue(): EventMessageHandler {
   // Create a promise queue so that only one message is handled at a time.
   const processorQueue = new PQueue({ concurrency: 1 });
   const handler: EventMessageHandler = {
-    handleRawEventRequest: (eventPath: string, payload: string, db: DataStore) => {
+    handleRawEventRequest: (eventPath: string, payload: string, db: DataStore | null) => {
       return processorQueue
         .add(() => handleRawEventRequest(eventPath, payload, db))
         .catch(e => {
@@ -682,7 +346,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleBlockMessage: (chainId: ChainID, msg: CoreNodeBlockMessage, db: DataStore) => {
+    handleBlockMessage: (chainId: ChainID, msg: CoreNodeBlockMessage, db: DataStore | null) => {
       return processorQueue
         .add(() => handleBlockMessage(chainId, msg, db))
         .catch(e => {
@@ -690,7 +354,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleMicroblockMessage: (chainId: ChainID, msg: CoreNodeMicroblockMessage, db: DataStore) => {
+    handleMicroblockMessage: (chainId: ChainID, msg: CoreNodeMicroblockMessage, db: DataStore | null) => {
       return processorQueue
         .add(() => handleMicroblockMessage(chainId, msg, db))
         .catch(e => {
@@ -698,7 +362,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleBurnBlock: (msg: CoreNodeBurnBlockMessage, db: DataStore) => {
+    handleBurnBlock: (msg: CoreNodeBurnBlockMessage, db: DataStore | null) => {
       return processorQueue
         .add(() => handleBurnBlockMessage(msg, db))
         .catch(e => {
@@ -706,7 +370,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleMempoolTxs: (rawTxs: string[], db: DataStore) => {
+    handleMempoolTxs: (rawTxs: string[], db: DataStore | null) => {
       return processorQueue
         .add(() => handleMempoolTxsMessage(rawTxs, db))
         .catch(e => {
@@ -714,7 +378,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleDroppedMempoolTxs: (msg: CoreNodeDropMempoolTxMessage, db: DataStore) => {
+    handleDroppedMempoolTxs: (msg: CoreNodeDropMempoolTxMessage, db: DataStore | null) => {
       return processorQueue
         .add(() => handleDroppedMempoolTxsMessage(msg, db))
         .catch(e => {
@@ -722,7 +386,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleNewAttachment: (msg: CoreNodeAttachmentMessage[], db: DataStore) => {
+    handleNewAttachment: (msg: CoreNodeAttachmentMessage[], db: DataStore | null) => {
       return processorQueue
         .add(() => handleNewAttachmentMessage(msg, db))
         .catch(e => {
@@ -741,7 +405,6 @@ export type EventStreamServer = net.Server & {
 };
 
 export async function startEventServer(opts: {
-  datastore: DataStore;
   chainId: ChainID;
   messageHandler?: EventMessageHandler;
   /** If not specified, this is read from the STACKS_CORE_EVENT_HOST env var. */
@@ -750,7 +413,7 @@ export async function startEventServer(opts: {
   serverPort?: number;
   httpLogLevel?: LogLevel;
 }): Promise<EventStreamServer> {
-  const db = opts.datastore;
+  const db = null;
   const messageHandler = opts.messageHandler ?? createMessageProcessorQueue();
 
   let eventHost = opts.serverHost ?? process.env['STACKS_CORE_EVENT_HOST'];
@@ -850,8 +513,6 @@ export async function startEventServer(opts: {
 
   app.postAsync('/attachments/new', async (req, res) => {
     try {
-      const msg: CoreNodeAttachmentMessage[] = req.body;
-      await messageHandler.handleNewAttachment(msg, db);
       res.status(200).json({ result: 'ok' });
     } catch (error) {
       logError(`error processing core-node /attachments/new: ${error}`, error);
@@ -866,6 +527,18 @@ export async function startEventServer(opts: {
       res.status(200).json({ result: 'ok' });
     } catch (error) {
       logError(`error processing core-node /new_microblocks: ${error}`, error);
+      res.status(500).json({ error: error });
+    }
+  });
+
+  app.postAsync('/mined_block', async (req, res) => {
+    try {
+      const msg: CoreNodeMinedBlock = req.body;
+      logger.verbose("Received mined block event");
+      //      await messageHandler.handleMinedBlock(opts.chainId, msg, db);
+      res.status(200).json({ result: 'ok' });
+    } catch (error) {
+      logError(`error processing core-node /mined_block: ${error}`, error);
       res.status(500).json({ error: error });
     }
   });

@@ -25,6 +25,33 @@ interface CoreNodeEventBase {
   committed: boolean;
 }
 
+export interface CoreNodeMinedTransactionEvent {
+  Success?: {
+    txid: string;
+    fee: number;
+    execution_cost: CoreNodeExecutionCostMessage;
+    result: string;
+  },
+  TransactionErrorEvent?: {
+    txid: string;
+    error: string,
+  },
+  TransactionSkippedEvent?: {
+    txid: string;
+    error: string,
+  },
+}
+
+export interface CoreNodeMinedBlock {
+  target_burn_height: number;
+  block_hash: string;
+  stacks_height: number;
+  block_size: number;
+  anchored_cost: CoreNodeExecutionCostMessage;
+  confirmed_microblocks_cost: CoreNodeExecutionCostMessage;
+  tx_events: CoreNodeMinedTransactionEvent[];
+}
+
 interface SmartContractEvent extends CoreNodeEventBase {
   type: CoreNodeEventType.ContractEvent;
   contract_event: {
