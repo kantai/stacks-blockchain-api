@@ -21,7 +21,6 @@ import {
   CoreNodeEvent,
 } from './core-node-message';
 import {
-  DataStore,
   createDbTxFromCoreMsg,
   DbEventBase,
   DbSmartContractEvent,
@@ -68,45 +67,145 @@ import { SqliteDataStore } from './event-store';
 
 import * as zoneFileParser from 'zone-file';
 
+const METRICS_WINDOW_SIZE = 4;
+
+async function collectMetrics(db: SqliteDataStore): Promise<void> {
+  // 0. Get burn block height
+  let burn_height = await db.getBurnBlockHeight();
+
+  logger.info(`burn height: ${burn_height}`);
+
+  if (burn_height < METRICS_WINDOW_SIZE) {
+    return;
+  }
+
+  let start = burn_height - METRICS_WINDOW_SIZE;
+  let stop = burn_height;
+
+  // 1. block orphan rate
+  let blocks = await db.getStacksBlocksBetweenBurnHeights(start, stop);
+
+  if (blocks.length < 1) {
+    return;
+  }
+
+  let blocks_map = new Map<string, { index_block_hash: string, parent_index_block_hash: string, burn_height: number }>();
+  for (const block of blocks) {
+    blocks_map.set(block.index_block_hash, block);
+  }
+
+  // count "good" by traversing from chain tip
+  let good_cursor: { index_block_hash: string; parent_index_block_hash: string; burn_height: number } | undefined = blocks[0];
+  let good_count = 0;
+  while (good_cursor != undefined) {
+    good_count += 1;
+    good_cursor = blocks_map.get(good_cursor.parent_index_block_hash);
+  }
+
+  let block_orphan_percent = 100 * (1 - (good_count / blocks.length));
+
+  // 2. Flash blocks
+  let flash_block_count = await db.getNoBurnCountBetweenBurnHeights(start, stop);
+
+
+  // get stacks height
+
+  let stacks_height = await db.getStacksHeight();
+
+  // 3. Get confirmable tx count at stacks_height + 1
+
+  let confirmable_tx_count = await db.countSuccessMinedTransactionsAt(stacks_height + 1);
+
+  // 4. Get unconfirmable tx count at stacks_height + 1
+
+  let unconfirmable_tx_count = await db.getFailedMinedTransactionsAt(stacks_height + 1);
+
+  // 5. Get considered tx count
+
+  let considered = confirmable_tx_count + unconfirmable_tx_count;
+
+  // 7. Average cost of mock mined transactions
+
+  let fees_costs = await db.getSuccessMinedTransactionsAt(stacks_height + 1);
+
+  let total_fees_costs = fees_costs.reduce((a, b) => {
+    return { fee: a.fee + b.fee, scalar_cost: a.scalar_cost + b.scalar_cost }
+  }, { fee: 0, scalar_cost: 1 });
+
+  let average_fees = total_fees_costs.fee / fees_costs.length;
+  let average_costs = total_fees_costs.scalar_cost / fees_costs.length;
+
+  // 8. Average cost of confirmed transactions
+
+  fees_costs = await db.getConfirmedTransactionsAt(stacks_height);
+
+  total_fees_costs = fees_costs.reduce((a, b) => {
+    return { fee: a.fee + b.fee, scalar_cost: a.scalar_cost + b.scalar_cost }
+  }, { fee: 0, scalar_cost: 1 });
+
+  let confirmed_average_fees = total_fees_costs.fee / fees_costs.length;
+  let confirmed_average_costs = total_fees_costs.scalar_cost / fees_costs.length;
+
+  // 9. Transactions confirmed in block
+
+  let confirmed_tx_count = fees_costs.length;
+
+  // 10. Median transaction confirmation delay over window
+
+  // find the first stacks height that is outside the window
+  let block_cursor: { index_block_hash: string; parent_index_block_hash: string; burn_height: number } | undefined = blocks[0];
+  while (block_cursor != undefined && block_cursor.burn_height > start) {
+    block_cursor = blocks_map.get(block_cursor.parent_index_block_hash);
+  }
+
+  if (block_cursor == null) {
+    logger.warn("Not enough data yet to evaluate confirmation delay");
+    return;
+  }
+
+  let stacks_height_start = await db.getStacksHeightOfIndexHash(block_cursor.index_block_hash);
+  let stacks_height_end = await db.getStacksHeightOfIndexHash(blocks[0].index_block_hash);
+
+  if (stacks_height_start == null || stacks_height_end == null) {
+    logger.error("Could not find stacks block that should have been recorded");
+    return;
+  }
+
+  let confirmed_tx_delays = [];
+  for(let i = stacks_height_start; i <= stacks_height_end; i++){
+    const results = await db.getConfirmedTransactionsFromMempool(i);
+    results.forEach((tx) => { confirmed_tx_delays.push(tx) });
+  }
+
+  logger.info(`orphan rate: ${block_orphan_percent} (${good_count} / ${blocks.length}), flash block count: ${flash_block_count}, confirmable txs: ${confirmable_tx_count}, unconfirmable txs: ${unconfirmable_tx_count}, considered: ${considered}`);
+}
+
 async function handleRawEventRequest(
   eventPath: string,
   payload: string,
-  db: DataStore | null
+  db: SqliteDataStore
 ): Promise<void> {
 }
 
 async function handleBurnBlockMessage(
   burnBlockMsg: CoreNodeBurnBlockMessage,
-  db: DataStore | null
+  db: SqliteDataStore
 ): Promise<void> {
   logger.verbose(
     `Received burn block message hash ${burnBlockMsg.burn_block_hash}, height: ${burnBlockMsg.burn_block_height}, reward recipients: ${burnBlockMsg.reward_recipients.length}`
   );
-  const rewards = burnBlockMsg.reward_recipients.map((r, index) => {
-    const dbReward: DbBurnchainReward = {
-      canonical: true,
-      burn_block_hash: burnBlockMsg.burn_block_hash,
-      burn_block_height: burnBlockMsg.burn_block_height,
-      burn_amount: BigInt(burnBlockMsg.burn_amount),
-      reward_recipient: r.recipient,
-      reward_amount: BigInt(r.amt),
-      reward_index: index,
-    };
-    return dbReward;
-  });
-  const slotHolders = burnBlockMsg.reward_slot_holders.map((r, index) => {
-    const slotHolder: DbRewardSlotHolder = {
-      canonical: true,
-      burn_block_hash: burnBlockMsg.burn_block_hash,
-      burn_block_height: burnBlockMsg.burn_block_height,
-      address: r,
-      slot_index: index,
-    };
-    return slotHolder;
-  });
+  const rewards = burnBlockMsg.reward_recipients
+        .map(r => r.amt)
+        .reduce((a, b) => a + b, 0);
+
+  const burns = burnBlockMsg.burn_amount
+
+  const total_spend = (rewards + burns);
+
+  db.writeBurnBlockData(burnBlockMsg.burn_block_height, burnBlockMsg.burn_block_hash, total_spend);
 }
 
-async function handleMempoolTxsMessage(rawTxs: string[], db: DataStore | null): Promise<void> {
+async function handleMempoolTxsMessage(rawTxs: string[], db: SqliteDataStore): Promise<void> {
   logger.verbose(`Received ${rawTxs.length} mempool transactions`);
   // TODO: mempool-tx receipt date should be sent from the core-node
   const receiptDate = Math.round(Date.now() / 1000);
@@ -125,6 +224,7 @@ async function handleMempoolTxsMessage(rawTxs: string[], db: DataStore | null): 
       rawTx: buffer,
     };
   });
+
   const dbMempoolTxs = decodedTxs.map(tx => {
     logger.verbose(`Received mempool tx: ${tx.txId}`);
     const dbMempoolTx = createDbMempoolTxFromCoreMsg({
@@ -137,11 +237,14 @@ async function handleMempoolTxsMessage(rawTxs: string[], db: DataStore | null): 
     });
     return dbMempoolTx;
   });
+
+  let received_height = await db.getStacksHeight();
+  await db.writeReceivedTxs(dbMempoolTxs, received_height);
 }
 
 async function handleDroppedMempoolTxsMessage(
   msg: CoreNodeDropMempoolTxMessage,
-  db: DataStore | null
+  db: SqliteDataStore
 ): Promise<void> {
   logger.verbose(`Received ${msg.dropped_txids.length} dropped mempool txs`);
   const dbTxStatus = getTxDbStatus(msg.reason);
@@ -150,7 +253,7 @@ async function handleDroppedMempoolTxsMessage(
 async function handleMicroblockMessage(
   chainId: ChainID,
   msg: CoreNodeMicroblockMessage,
-  db: DataStore | null
+  db: SqliteDataStore
 ): Promise<void> {
   logger.verbose(`Received microblock with ${msg.transactions.length} txs`);
   const dbMicroblocks = parseMicroblocksFromTxs({
@@ -191,10 +294,18 @@ async function handleMicroblockMessage(
   });
 }
 
+async function handleMinedBlock(
+  chainId: ChainID,
+  msg: CoreNodeMinedBlock,
+  db: SqliteDataStore
+): Promise<void> {
+  await db.writeMinedTransactions(msg.tx_events, msg.stacks_height);
+}
+
 async function handleBlockMessage(
   chainId: ChainID,
   msg: CoreNodeBlockMessage,
-  db: DataStore | null
+  db: SqliteDataStore
 ): Promise<void> {
   const parsedTxs: CoreNodeParsedTxMessage[] = [];
   const blockData: CoreNodeMsgBlockData = {
@@ -227,16 +338,15 @@ async function handleBlockMessage(
     execution_cost_write_length: 0,
   };
 
+  await db.writeStacksBlock(dbBlock);
+
   logger.verbose(`Received block ${msg.block_hash} (${msg.block_height}) from node`, dbBlock);
 
   parsedTxs.forEach(tx => {
     logger.verbose(`Received anchor block mined tx: ${tx.core_tx.txid}`);
-    logger.info('Transaction confirmed', {
-      txid: tx.core_tx.txid,
-      in_microblock: tx.microblock_hash != '',
-      stacks_height: dbBlock.block_height,
-    });
   });
+
+  await db.writeConfirmedTxs(parsedTxs, dbBlock.block_height);
 }
 
 function parseDataStoreTxEventData(
@@ -313,32 +423,29 @@ function parseDataStoreTxEventData(
   return dbData;
 }
 
-async function handleNewAttachmentMessage(msg: CoreNodeAttachmentMessage[], db: DataStore | null) {
-}
-
 interface EventMessageHandler {
-  handleRawEventRequest(eventPath: string, payload: string, db: DataStore | null): Promise<void> | void;
+  handleRawEventRequest(eventPath: string, payload: string, db: SqliteDataStore): Promise<void> | void;
   handleBlockMessage(
     chainId: ChainID,
     msg: CoreNodeBlockMessage,
-    db: DataStore | null
+    db: SqliteDataStore
   ): Promise<void> | void;
   handleMicroblockMessage(
     chainId: ChainID,
     msg: CoreNodeMicroblockMessage,
-    db: DataStore | null
+    db: SqliteDataStore
   ): Promise<void> | void;
-  handleMempoolTxs(rawTxs: string[], db: DataStore | null): Promise<void> | void;
-  handleBurnBlock(msg: CoreNodeBurnBlockMessage, db: DataStore | null): Promise<void> | void;
-  handleDroppedMempoolTxs(msg: CoreNodeDropMempoolTxMessage, db: DataStore | null): Promise<void> | void;
-  handleNewAttachment(msg: CoreNodeAttachmentMessage[], db: DataStore | null): Promise<void> | void;
+  handleMempoolTxs(rawTxs: string[], db: SqliteDataStore): Promise<void> | void;
+  handleBurnBlock(msg: CoreNodeBurnBlockMessage, db: SqliteDataStore): Promise<void> | void;
+  handleDroppedMempoolTxs(msg: CoreNodeDropMempoolTxMessage, db: SqliteDataStore): Promise<void> | void;
+  handleMinedBlock(chainId: ChainID, msg: CoreNodeMinedBlock, db: SqliteDataStore): Promise<void> | void;
 }
 
 function createMessageProcessorQueue(): EventMessageHandler {
   // Create a promise queue so that only one message is handled at a time.
   const processorQueue = new PQueue({ concurrency: 1 });
   const handler: EventMessageHandler = {
-    handleRawEventRequest: (eventPath: string, payload: string, db: DataStore | null) => {
+    handleRawEventRequest: (eventPath: string, payload: string, db: SqliteDataStore) => {
       return processorQueue
         .add(() => handleRawEventRequest(eventPath, payload, db))
         .catch(e => {
@@ -346,7 +453,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleBlockMessage: (chainId: ChainID, msg: CoreNodeBlockMessage, db: DataStore | null) => {
+    handleBlockMessage: (chainId: ChainID, msg: CoreNodeBlockMessage, db: SqliteDataStore) => {
       return processorQueue
         .add(() => handleBlockMessage(chainId, msg, db))
         .catch(e => {
@@ -354,7 +461,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleMicroblockMessage: (chainId: ChainID, msg: CoreNodeMicroblockMessage, db: DataStore | null) => {
+    handleMicroblockMessage: (chainId: ChainID, msg: CoreNodeMicroblockMessage, db: SqliteDataStore) => {
       return processorQueue
         .add(() => handleMicroblockMessage(chainId, msg, db))
         .catch(e => {
@@ -362,7 +469,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleBurnBlock: (msg: CoreNodeBurnBlockMessage, db: DataStore | null) => {
+    handleBurnBlock: (msg: CoreNodeBurnBlockMessage, db: SqliteDataStore) => {
       return processorQueue
         .add(() => handleBurnBlockMessage(msg, db))
         .catch(e => {
@@ -370,7 +477,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleMempoolTxs: (rawTxs: string[], db: DataStore | null) => {
+    handleMempoolTxs: (rawTxs: string[], db: SqliteDataStore) => {
       return processorQueue
         .add(() => handleMempoolTxsMessage(rawTxs, db))
         .catch(e => {
@@ -378,7 +485,7 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleDroppedMempoolTxs: (msg: CoreNodeDropMempoolTxMessage, db: DataStore | null) => {
+    handleDroppedMempoolTxs: (msg: CoreNodeDropMempoolTxMessage, db: SqliteDataStore) => {
       return processorQueue
         .add(() => handleDroppedMempoolTxsMessage(msg, db))
         .catch(e => {
@@ -386,14 +493,15 @@ function createMessageProcessorQueue(): EventMessageHandler {
           throw e;
         });
     },
-    handleNewAttachment: (msg: CoreNodeAttachmentMessage[], db: DataStore | null) => {
+    handleMinedBlock: (chainId: ChainID, msg: CoreNodeMinedBlock, db: SqliteDataStore) => {
       return processorQueue
-        .add(() => handleNewAttachmentMessage(msg, db))
+        .add(() => handleMinedBlock(chainId, msg, db))
         .catch(e => {
-          logError(`Error processing new attachment message`, e, msg);
+          logError(`Error processing core node block message`, e, msg);
           throw e;
         });
     },
+
   };
 
   return handler;
@@ -413,7 +521,9 @@ export async function startEventServer(opts: {
   serverPort?: number;
   httpLogLevel?: LogLevel;
 }): Promise<EventStreamServer> {
-  const db = null;
+  const db = await SqliteDataStore.open("/tmp/event-server.sqlite");
+  await db.createTables();
+
   const messageHandler = opts.messageHandler ?? createMessageProcessorQueue();
 
   let eventHost = opts.serverHost ?? process.env['STACKS_CORE_EVENT_HOST'];
@@ -502,8 +612,6 @@ export async function startEventServer(opts: {
 
   app.postAsync('/drop_mempool_tx', async (req, res) => {
     try {
-      const msg: CoreNodeDropMempoolTxMessage = req.body;
-      await messageHandler.handleDroppedMempoolTxs(msg, db);
       res.status(200).json({ result: 'ok' });
     } catch (error) {
       logError(`error processing core-node /drop_mempool_tx: ${error}`, error);
@@ -535,8 +643,9 @@ export async function startEventServer(opts: {
     try {
       const msg: CoreNodeMinedBlock = req.body;
       logger.verbose("Received mined block event");
-      //      await messageHandler.handleMinedBlock(opts.chainId, msg, db);
+      await messageHandler.handleMinedBlock(opts.chainId, msg, db);
       res.status(200).json({ result: 'ok' });
+      await collectMetrics(db);
     } catch (error) {
       logError(`error processing core-node /mined_block: ${error}`, error);
       res.status(500).json({ error: error });

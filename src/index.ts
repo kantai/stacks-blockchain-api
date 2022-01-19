@@ -129,7 +129,7 @@ function initApp() {
 }
 
 async function handleProgramArgs() {
-  logger.level = 'verbose';
+  logger.level = 'info';
   initApp();
 }
 
