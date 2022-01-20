@@ -95,26 +95,24 @@ async function init(): Promise<void> {
     forceKillable: false,
   });
 
-  if (isProdEnv) {
-    const prometheusServer = await createPrometheusServer({ port: 9153 });
-    logger.info(`@promster/server started on port 9153.`);
-    const sockets = new Set<Socket>();
-    prometheusServer.on('connection', socket => {
-      sockets.add(socket);
-      socket.once('close', () => sockets.delete(socket));
-    });
-    registerShutdownConfig({
-      name: 'Prometheus',
-      handler: async () => {
-        for (const socket of sockets) {
-          socket.destroy();
-          sockets.delete(socket);
-        }
-        await Promise.resolve(prometheusServer.close());
-      },
-      forceKillable: true,
-    });
-  }
+  const prometheusServer = await createPrometheusServer({ port: 9153 });
+  logger.info(`@promster/server started on port 9153.`);
+  const sockets = new Set<Socket>();
+  prometheusServer.on('connection', socket => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+  registerShutdownConfig({
+    name: 'Prometheus',
+    handler: async () => {
+      for (const socket of sockets) {
+        socket.destroy();
+        sockets.delete(socket);
+      }
+      await Promise.resolve(prometheusServer.close());
+    },
+    forceKillable: true,
+  });
 }
 
 function initApp() {

@@ -66,12 +66,39 @@ import {
 import { SqliteDataStore } from './event-store';
 
 import * as zoneFileParser from 'zone-file';
+import * as promClient from 'prom-client';
 
 const METRICS_WINDOW_SIZE = 4;
 
-async function collectMetrics(db: SqliteDataStore): Promise<void> {
+const ORPHAN_RATE = new promClient.Gauge({
+  name: 'orphan_rate',
+  help: 'Stacks block orphan percentage over the last METRICS_WINDOW_SIZE bitcoin blocks',
+});
+
+const FLASH_BLOCK_COUNT = new promClient.Gauge({
+  name: 'flash_blocks',
+  help: 'Flash bitcoin block count over the last METRICS_WINDOW_SIZE bitcoin blocks',
+});
+
+const CONFIRMED_AVERAGE_FEES = new promClient.Gauge({
+  name: 'confirmed_tx_avg_fee',
+  help: 'Average total fee of transactions confirmed in the last Stacks block',
+});
+
+const CONFIRMED_AVERAGE_COST = new promClient.Gauge({
+  name: 'confirmed_tx_avg_cost',
+  help: 'Average scalar cost of transactions confirmed in the last Stacks block',
+});
+
+async function updateStacksBlockMetrics(opts: {
+  db: SqliteDataStore;
+  burnHeight?: number;
+  stacksHeight?: number;
+}): Promise<void> {
   // 0. Get burn block height
-  let burn_height = await db.getBurnBlockHeight();
+  const db = opts.db;
+
+  const burn_height = opts.burnHeight ?? await db.getBurnBlockHeight();
 
   logger.info(`burn height: ${burn_height}`);
 
@@ -104,47 +131,31 @@ async function collectMetrics(db: SqliteDataStore): Promise<void> {
 
   let block_orphan_percent = 100 * (1 - (good_count / blocks.length));
 
+  ORPHAN_RATE.set(block_orphan_percent);
+
   // 2. Flash blocks
   let flash_block_count = await db.getNoBurnCountBetweenBurnHeights(start, stop);
 
+  FLASH_BLOCK_COUNT.set(flash_block_count);
 
   // get stacks height
 
-  let stacks_height = await db.getStacksHeight();
+  const stacks_height = opts.stacksHeight ?? await db.getStacksHeight();
 
-  // 3. Get confirmable tx count at stacks_height + 1
 
-  let confirmable_tx_count = await db.countSuccessMinedTransactionsAt(stacks_height + 1);
+  // 8. Average cost of confirmed transactions
 
-  // 4. Get unconfirmable tx count at stacks_height + 1
-
-  let unconfirmable_tx_count = await db.getFailedMinedTransactionsAt(stacks_height + 1);
-
-  // 5. Get considered tx count
-
-  let considered = confirmable_tx_count + unconfirmable_tx_count;
-
-  // 7. Average cost of mock mined transactions
-
-  let fees_costs = await db.getSuccessMinedTransactionsAt(stacks_height + 1);
+  let fees_costs = await db.getConfirmedTransactionsAt(stacks_height);
 
   let total_fees_costs = fees_costs.reduce((a, b) => {
     return { fee: a.fee + b.fee, scalar_cost: a.scalar_cost + b.scalar_cost }
   }, { fee: 0, scalar_cost: 1 });
 
-  let average_fees = total_fees_costs.fee / fees_costs.length;
-  let average_costs = total_fees_costs.scalar_cost / fees_costs.length;
-
-  // 8. Average cost of confirmed transactions
-
-  fees_costs = await db.getConfirmedTransactionsAt(stacks_height);
-
-  total_fees_costs = fees_costs.reduce((a, b) => {
-    return { fee: a.fee + b.fee, scalar_cost: a.scalar_cost + b.scalar_cost }
-  }, { fee: 0, scalar_cost: 1 });
-
   let confirmed_average_fees = total_fees_costs.fee / fees_costs.length;
   let confirmed_average_costs = total_fees_costs.scalar_cost / fees_costs.length;
+
+  CONFIRMED_AVERAGE_COST.set(confirmed_average_costs);
+  CONFIRMED_AVERAGE_FEES.set(confirmed_average_fees);
 
   // 9. Transactions confirmed in block
 
@@ -177,7 +188,53 @@ async function collectMetrics(db: SqliteDataStore): Promise<void> {
     results.forEach((tx) => { confirmed_tx_delays.push(tx) });
   }
 
-  logger.info(`orphan rate: ${block_orphan_percent} (${good_count} / ${blocks.length}), flash block count: ${flash_block_count}, confirmable txs: ${confirmable_tx_count}, unconfirmable txs: ${unconfirmable_tx_count}, considered: ${considered}`);
+}
+
+
+async function updateMockMinedBlockMetrics(opts: {
+  db: SqliteDataStore;
+  burnHeight?: number;
+  stacksHeight?: number;
+}): Promise<void> {
+  // 0. Get burn block height
+  const db = opts.db;
+
+  const burn_height = opts.burnHeight ?? await db.getBurnBlockHeight();
+
+  logger.info(`burn height: ${burn_height}`);
+
+  if (burn_height < METRICS_WINDOW_SIZE) {
+    return;
+  }
+
+  let start = burn_height - METRICS_WINDOW_SIZE;
+  let stop = burn_height;
+
+  const stacks_height = opts.stacksHeight ?? await db.getStacksHeight();
+
+  // 3. Get confirmable tx count at stacks_height + 1
+
+  let confirmable_tx_count = await db.countSuccessMinedTransactionsAt(stacks_height + 1);
+
+  // 4. Get unconfirmable tx count at stacks_height + 1
+
+  let unconfirmable_tx_count = await db.getFailedMinedTransactionsAt(stacks_height + 1);
+
+  // 5. Get considered tx count
+
+  let considered = confirmable_tx_count + unconfirmable_tx_count;
+
+  // 7. Average cost of mock mined transactions
+
+  let fees_costs = await db.getSuccessMinedTransactionsAt(stacks_height + 1);
+
+  let total_fees_costs = fees_costs.reduce((a, b) => {
+    return { fee: a.fee + b.fee, scalar_cost: a.scalar_cost + b.scalar_cost }
+  }, { fee: 0, scalar_cost: 1 });
+
+  let average_fees = total_fees_costs.fee / fees_costs.length;
+  let average_costs = total_fees_costs.scalar_cost / fees_costs.length;
+
 }
 
 async function handleRawEventRequest(
@@ -582,6 +639,7 @@ export async function startEventServer(opts: {
       const msg: CoreNodeBlockMessage = req.body;
       await messageHandler.handleBlockMessage(opts.chainId, msg, db);
       res.status(200).json({ result: 'ok' });
+      updateStacksBlockMetrics({ db });
     } catch (error) {
       logError(`error processing core-node /new_block: ${error}`, error);
       res.status(500).json({ error: error });
@@ -645,7 +703,7 @@ export async function startEventServer(opts: {
       logger.verbose("Received mined block event");
       await messageHandler.handleMinedBlock(opts.chainId, msg, db);
       res.status(200).json({ result: 'ok' });
-      await collectMetrics(db);
+      await updateMockMinedBlockMetrics({ db });
     } catch (error) {
       logError(`error processing core-node /mined_block: ${error}`, error);
       res.status(500).json({ error: error });
